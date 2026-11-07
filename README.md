@@ -103,6 +103,11 @@ only dependency is the Julia runtime shipped next to it. On macOS arm64 the libr
 the runtime 10 MB. The run-time plans the library uses (`FFTL.RPlan`, `FFTL.RRFFTPlan`,
 `FFTL.RR2RPlan`) are public, so Julia programs that use them can be trimmed the same way.
 
+**WebAssembly.** On this branch FFTL compiles to WebAssembly with
+[WasmCodegen.jl](https://github.com/gbaraldi/WasmCodegen.jl): unmodified FFTL code runs in a browser, Node or Bun,
+through the same run-time plans. A prebuilt module of the common transforms is attached to the `wasm-v*` releases.
+See [WASM.md](WASM.md) for how to use it from JavaScript or compile your own program, and for its limits.
+
 **Entry points for special variants.** `FFTL.plan_pass(v, d)` transforms all lines of a strided view
 along one dimension, and `FFTL.plan_r2r_pass` does the same for real-to-real kinds. Libraries that build
 their own transforms from one-dimensional passes use these; NFFT.jl is one of them.
