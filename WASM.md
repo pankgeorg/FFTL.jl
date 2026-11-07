@@ -160,3 +160,12 @@ plans with one thread. Each time is per transform with a precomputed plan (`mul!
 | `selectdim` with a run-time dimension ([#80](https://github.com/gbaraldi/WasmCodegen.jl/pull/80)) | WasmCodegen | `dct`/`idct` scaling overlay in the extension |
 | Normal (compile-time) plans in Wasm | FFTL's design | the extension uses the run-time plans; a per-stage dispatch costs a little speed natively, not measured in Wasm |
 | SIMD.jl lanes merged into WasmCompat main | WasmCompat [#6](https://github.com/pankgeorg/WasmCompat.jl/pull/6) | `wasm/Project.toml` pins the `simd-lanes` branch |
+
+## Follow-ups
+
+- When [WasmCodegen.jl#80](https://github.com/gbaraldi/WasmCodegen.jl/pull/80) is merged, the DCT-scaling overlay
+  in the extension (`dct`, `idct`, `*(::OrthoDCTPlan, x)`, ~30 lines) can go for one-dimensional transforms. On N-D
+  arrays, `selectdim` with a run-time dimension is a dynamic call (a `SubArray` of unknown dimensionality), so N-D
+  `dct` still needs the overlay or an FFTL change that scales by index.
+- When [WasmCompat.jl#6](https://github.com/pankgeorg/WasmCompat.jl/pull/6) is merged, `wasm/Project.toml` can take
+  WasmCompat from main instead of the `simd-lanes` branch.
