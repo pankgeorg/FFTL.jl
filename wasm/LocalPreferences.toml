@@ -1,0 +1,4 @@
+# FFTL compiles the codelets of its "lazy" radices (17-31) on first use, through callables made at run time. A
+# module compiled ahead of time cannot do that, so here (as for libfftl) every codelet is compiled with the package.
+[FFTL]
+lazy_radices = []

@@ -64,8 +64,8 @@ for timing.
 Your program calls FFTL as usual. The build script loads WasmCodegen, FFTL, WasmCompat and SIMD:
 
 ```julia
-# build.jl: julia --project=<env> build.jl, in an environment with WasmCodegen, WasmCompat (branch simd-lanes),
-# SIMD and this FFTL
+# build.jl: julia --project=<env> build.jl, in an environment with WasmCodegen, WasmCompat, SIMD and this FFTL,
+# and FFTL's preference lazy_radices = [] (see below)
 using WasmCodegen, FFTL, WasmCompat, SIMD
 
 function peak(n::Int)                       # your program: plain FFTL
@@ -84,8 +84,8 @@ const { instance } = await instantiate(fs.readFileSync('peak.wasm'));
 console.log(instance.exports.peak(1000n));   // 5n
 ```
 
-This example, as written, builds in about 6 minutes (wall time, including precompilation and `wasm-opt -O3` on two
-threads) into a 3.0 MB module, and prints 5, as native Julia does.
+This example, as written, builds in about 3 minutes (wall time, including loading the packages and `wasm-opt -O3` on
+two threads) into a 1.8 MB module, and prints 5, as native Julia does.
 
 What each piece does:
 - **`FFTLWasmCodegenExt`**, this package's extension, is loaded with WasmCodegen
@@ -96,15 +96,24 @@ What each piece does:
     `rfft`, `dct`, `plan_dct`, ...). The normal plans carry their radix sequence in their type, so they cannot be
     compiled ahead of time. The run-time plans are the ones `juliac --trim` and libfftl use, with the same
     codelets.
-  - **Threads.** Plans get one thread, and the helpers that start tasks run their items in order.
-  - **DCT scaling.** `dct`, `idct` and `plan_dct` scale the first element of each dimension by index rather than
-    with `selectdim`. With a run-time dimension, `selectdim` made an invalid module before
-    [WasmCodegen.jl#80](https://github.com/gbaraldi/WasmCodegen.jl/pull/80).
-  - **Build hosts with target intrinsics.** On Apple silicon (FCMA) and x86 with AVX2, the generic complex
-    arithmetic replaces the LLVM target intrinsics.
-- **WasmCompat's `WasmCompatSIMDExt`** runs SIMD.jl's vector intrinsics (the codelets' arithmetic and shuffles) lane
-  by lane. **`WasmCompatBaseExt`** makes `Base.generating_output()` false. Both are on the `simd-lanes` branch,
-  [WasmCompat.jl#6](https://github.com/pankgeorg/WasmCompat.jl/pull/6).
+  - **Threads.** Plans get one thread, and the helpers that start tasks run their items in order. FFTL's task
+    helpers contain `Threads.@spawn`, and WasmCodegen compiles programs of one task by default.
+  - **N-D DCT scaling.** `dct`, `idct` and `plan_dct(x) * x` of 2- to 6-dimensional arrays scale the first element
+    of each dimension by index rather than with `selectdim`. On an N-D array, `selectdim` with a run-time dimension
+    is a `SubArray` of unknown dimensionality, a dynamic call. Vectors use FFTL's own methods.
+  - **Build hosts with target intrinsics.** On Apple silicon (FCMA) and x86 with AVX2 or AVX-512, the generic
+    complex arithmetic replaces the LLVM target intrinsics.
+- **FFTL's preference `lazy_radices = []`**, in the build environment's `LocalPreferences.toml`
+  ([`wasm/LocalPreferences.toml`](wasm/LocalPreferences.toml)). By default FFTL compiles the codelets of radices
+  17–31 at their first call; a module compiled ahead of time needs them all compiled with the package, as libfftl
+  does.
+- **WasmCompat's `WasmCompatSIMDExt`** compiles the arithmetic (`+`, `-`, `*`, `/`, `muladd`, ...), loads and
+  stores of SIMD.jl's 16-byte float vectors (`Vec{2,Float64}`, `Vec{4,Float32}`, and `Vec{2,Float32}`) to WasmCodegen's
+  SIMD128 (`v128`) operations, and runs the other vector intrinsics (shuffles among them) lane by lane.
+  **`WasmCompatBaseExt`** makes `Base.generating_output()` false.
+- **`relaxed_simd`** (WasmCodegen's `Config`, off by default): on, a vector `muladd` is relaxed SIMD's
+  `relaxed_madd`, fused where the engine's hardware has FMA; off, a multiply and an add. `wasm/build.jl` takes
+  `RELAXED_SIMD=1`.
 
 Nothing else changes. FFTL doesn't time plans (the `flags` keyword is ignored natively too), its preferences are read
 when it is precompiled, and the KernelAbstractions paths are not reached from CPU arrays.
@@ -114,39 +123,45 @@ pins the versions it was built with.
 
 ## Limits
 
-Measured on an aarch64 Linux host with Node 24.22.1 (V8), one thread. The modules are `-O3`; native is FFTL's normal
-plans with one thread. Each time is per transform with a precomputed plan (`mul!(y, p, x)`), the median of 3 trials:
+Measured on an aarch64 Linux host (Neoverse-N1) with Node 24.22.1 (V8), one thread. The module is `-O3`; native is
+FFTL's normal plans with one thread. Each time is per transform with a precomputed plan (`mul!(y, p, x)`), the median
+of 3 trials, then the median of 5 rounds:
 
 | Transform | Size | Float64 native | Float64 Wasm | × | Float32 native | Float32 Wasm | × |
 |---|---|---:|---:|---:|---:|---:|---:|
-| `fft` | 64 | 0.26 µs | 38.6 µs | 149 | 0.168 µs | 22.5 µs | 134 |
-| `fft` | 1024 | 7.25 µs | 918 µs | 127 | 4.42 µs | 595 µs | 135 |
-| `fft` | 65536 | 904 µs | 111 ms | 123 | 522 µs | 67 ms | 128 |
-| `fft` | 1009 | 45.4 µs | 3.92 ms | 86 | 31 µs | 2.25 ms | 72 |
-| `ifft` | 1024 | 7.67 µs | 922 µs | 120 | 4.63 µs | 569 µs | 123 |
-| `fft2` | 64×64 | 31.8 µs | 3.94 ms | 124 | 18.9 µs | 2.53 ms | 133 |
-| `fft2` | 256×256 | 1.11 ms | 91.3 ms | 83 | 500 µs | 53.3 ms | 107 |
-| `rfft` | 1024 | 4.12 µs | 472 µs | 115 | 2.85 µs | 288 µs | 101 |
-| `rfft` | 65536 | 893 µs | 56.3 ms | 63 | 314 µs | 34.6 ms | 110 |
-| `rfft` | 1009 | 46.1 µs | 4.22 ms | 91 | 31.4 µs | 2.41 ms | 77 |
-| `irfft` | 1024 | 4.09 µs | 474 µs | 116 | 2.81 µs | 287 µs | 102 |
-| `dct` | 1024 | 8.52 µs | 678 µs | 80 | 4.82 µs | 403 µs | 84 |
-| `dct` | 1009 | 52.1 µs | 4.34 ms | 83 | 36.7 µs | 2.48 ms | 68 |
+| `fft` | 64 | 0.261 µs | 1.7 µs | 6.5 | 0.168 µs | 1.48 µs | 8.8 |
+| `fft` | 1024 | 7.32 µs | 44.2 µs | 6.0 | 4.47 µs | 34.6 µs | 7.7 |
+| `fft` | 65536 | 904 µs | 4.94 ms | 5.5 | 543 µs | 4.13 ms | 7.6 |
+| `fft` | 1009 | 45.6 µs | 234 µs | 5.1 | 31.3 µs | 209 µs | 6.7 |
+| `ifft` | 1024 | 7.74 µs | 46.1 µs | 5.9 | 4.67 µs | 36.8 µs | 7.9 |
+| `fft2` | 64×64 | 31.7 µs | 179 µs | 5.6 | 18.9 µs | 141 µs | 7.4 |
+| `fft2` | 256×256 | 1.18 ms | 4.12 ms | 3.5 | 736 µs | 3.42 ms | 4.6 |
+| `rfft` | 1024 | 4.12 µs | 24 µs | 5.8 | 2.89 µs | 20.7 µs | 7.2 |
+| `rfft` | 65536 | 379 µs | 2.2 ms | 5.8 | 306 µs | 2.2 ms | 7.2 |
+| `rfft` | 1009 | 46.3 µs | 265 µs | 5.7 | 31.6 µs | 263 µs | 8.3 |
+| `irfft` | 1024 | 4.14 µs | 24.9 µs | 6.0 | 2.84 µs | 21.3 µs | 7.5 |
+| `dct` | 1024 | 10 µs | 45.6 µs | 4.5 | 4.87 µs | 29.8 µs | 6.1 |
+| `dct` | 1009 | 52.6 µs | 282 µs | 5.4 | 34.5 µs | 280 µs | 8.1 |
 
-- **Speed:** about 100× below native: 63–149× on these sizes, the lower end (63–91×) on prime lengths (Bluestein),
-  on `dct` and on some large sizes. Three things account for it:
-  - Wasm here has no SIMD: SIMD.jl's 16-byte vectors run lane by lane. WasmCodegen has no SIMD128 lowering yet.
-  - FFTL's codelets load and store through pointers, which WasmCodegen reads and writes one byte at a time without
-    a static origin.
-  - There are no FMA instructions.
+- **Speed:** 3.5–8.8× below native on these sizes (median 6.1×): 3.5–6.5× in Float64, 4.6–8.8× in Float32. That is
+  9–24× faster than the previous release (`wasm-v2026-11-07`, 68–144× below native), from WasmCodegen's typed
+  pointer loads and stores, its typed views of arrays, and SIMD128. Float32 gains less than Float64 in Wasm (it is
+  1.0–1.5× faster than Float64 here, against 1.2–2.1× natively). What remains:
+  - every access through a pointer computes an address, its offset in the array behind it, and range checks;
+  - Wasm GC arrays have no 16-byte loads: a vector is loaded with two or four scalar `array.get`s;
+  - SIMD.jl's shuffles run lane by lane.
+  The Wasm times vary by at most 11% between rounds; the native times of the largest sizes (65536, 256×256) vary up
+  to 3.7× between rounds on this shared host, so their ratios are the least precise.
 - **Accuracy:** relative differences from native FFTL are at most 3.8e-16 (Float64) and 2.2e-7 (Float32), the same
-  size as FFTW's distance from native FFTL on the same cases. Native uses fused multiply-adds and the compile-time
-  chains; Wasm uses neither.
-- **Size:** the release module is 9.8 MB (9,830,248 bytes): all 18 transforms and the 12 bench exports; 14.1 MB before
+  size as FFTW's distance from native FFTL on the same cases. Native fuses multiply-adds; this module does not
+  (`relaxed_simd` off). Built with `RELAXED_SIMD=1`, 37 of the 50 cases are bitwise equal to native on this host
+  (all Float32 ones), against 4 here, at the same speed; such a module needs an engine with relaxed SIMD, and its
+  results depend on the machine.
+- **Size:** the release module is 6.5 MB (6,504,099 bytes): all 18 transforms and the 12 bench exports; 12.4 MB before
   `wasm-opt`. It contains every codelet of the run-time chains (20 radices, both signs, the vector widths and the
   stage kinds) for both element types.
-- **Build time:** the release module took about 2 minutes to compile and 42 minutes of `wasm-opt -O3` on two
-  threads (about 5 GB peak). `wasm-opt` dominates.
+- **Build time:** about 8.5 minutes for the release module (wall time, on two threads): 2 minutes to compile and 5.5
+  minutes of `wasm-opt -O3`, 1.5 GB peak.
 - **Not covered:** threads, GPU arrays, element types other than Float32/Float64 in Wasm (FFTL's generic path is
   not tested there), and in-place real plans.
 
@@ -154,18 +169,16 @@ plans with one thread. Each time is per transform with a precomputed plan (`mul!
 
 | Missing | Where | Effect today |
 |---|---|---|
-| SIMD128 lowering of SIMD.jl's 16-byte vectors | WasmCodegen | lanes run one by one (`WasmCompatSIMDExt`) |
-| Typed 4/8-byte loads through pointers without a static origin | WasmCodegen | byte-wise loads and stores in every codelet |
-| Smaller input to `wasm-opt` (reuse of locals) | WasmCodegen | 42 min of `wasm-opt` for the release module |
-| `selectdim` with a run-time dimension ([#80](https://github.com/gbaraldi/WasmCodegen.jl/pull/80)) | WasmCodegen | `dct`/`idct` scaling overlay in the extension |
+| 16-byte loads from Wasm GC arrays, and `v128` storage | WasmCodegen | a vector load is a range check and two or four scalar `array.get`s |
+| Cheaper pointer accesses | WasmCodegen | each access computes an address, an offset in its array and checks: most of the remaining gap |
+| SIMD128 shuffles from SIMD.jl | WasmCompat | `shufflevector` runs lane by lane |
+| `selectdim` with a run-time dimension on N-D arrays | WasmCodegen or FFTL | the N-D `dct`/`idct` scaling overlay in the extension |
+| Tasks in the default JavaScript host | WasmCodegen | one thread (`Config(tasks = :jspi)` needs `host = :wasi` with `:julia_io` and an engine with JSPI) |
 | Normal (compile-time) plans in Wasm | FFTL's design | the extension uses the run-time plans; a per-stage dispatch costs a little speed natively, not measured in Wasm |
-| SIMD.jl lanes merged into WasmCompat main | WasmCompat [#6](https://github.com/pankgeorg/WasmCompat.jl/pull/6) | `wasm/Project.toml` pins the `simd-lanes` branch |
 
 ## Follow-ups
 
-- When [WasmCodegen.jl#80](https://github.com/gbaraldi/WasmCodegen.jl/pull/80) is merged, the DCT-scaling overlay
-  in the extension (`dct`, `idct`, `*(::OrthoDCTPlan, x)`, ~30 lines) can go for one-dimensional transforms. On N-D
-  arrays, `selectdim` with a run-time dimension is a dynamic call (a `SubArray` of unknown dimensionality), so N-D
-  `dct` still needs the overlay or an FFTL change that scales by index.
-- When [WasmCompat.jl#6](https://github.com/pankgeorg/WasmCompat.jl/pull/6) is merged, `wasm/Project.toml` can take
-  WasmCompat from main instead of the `simd-lanes` branch.
+- If FFTL's `dct`, `idct` and `OrthoDCTPlan` scaled the first element of each dimension by index (type-stable natively
+  too), the N-D DCT overlay could go.
+- FFTL's `RPlan{T}(sz, region::Integer, σ)` throws natively (`collect(Int, 2)` is 0-dimensional); the extension
+  normalizes `region` itself. A one-line fix upstream would let it pass `region` through.

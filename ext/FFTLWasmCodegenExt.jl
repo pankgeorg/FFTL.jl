@@ -16,6 +16,9 @@ program, so native FFTL is unchanged.
   to arrays, as AbstractFFTs plans.
 - **One thread.** Plans get one thread whatever `threads` or `FFTL.set_num_threads` says, and the
   helpers that start tasks run their items in order, so `Threads.@spawn` is never compiled.
+- **N-D orthonormal DCT.** `dct`, `idct` and `plan_dct(x) * x` of 2- to 6-dimensional arrays scale by
+  index instead of `selectdim` with a run-time dimension (a dynamic call). Vectors use FFTL's own
+  methods.
 - **Build hosts with target intrinsics.** On an AArch64 host with the complex-number extension
   (Apple silicon) and on an x86 host with AVX2, FFTL's complex arithmetic calls LLVM target
   intrinsics (`llvm.aarch64.neon.vcadd.*`, `vcmla.*`, `llvm.x86.*.addsub.*`); here they take
@@ -24,8 +27,10 @@ program, so native FFTL is unchanged.
 Element types other than `Float32` and `Float64` (real or complex) keep FFTL's own methods. FFTL does
 not time plans (the `flags` are ignored natively too), its preferences are read when it is
 precompiled, and the KernelAbstractions paths are not reached from CPU arrays: none needs an
-overlay. The SIMD.jl vector intrinsics of the codelets are generic, and `WasmCompatSIMDExt`
-(WasmCompat.jl) runs them lane by lane.
+overlay. The SIMD.jl vector intrinsics of the codelets are generic: `WasmCompatSIMDExt` (WasmCompat.jl)
+maps them to WasmCodegen's SIMD128 (`v128`) where it can and runs the rest lane by lane. A module
+compiled ahead of time also needs FFTL's preference `lazy_radices = []` (see `wasm/LocalPreferences.toml`):
+otherwise the codelets of radices 17–31 are compiled at their first call.
 """
 module FFTLWasmCodegenExt
 
@@ -135,8 +140,11 @@ const FArray = Union{RArray,CArray}
 @overlay MT FFTL.plan_irfft(X::CArray, d::Integer, region = 1:ndims(X); kw...) = irplan(X, d, region)
 @overlay MT FFTL.plan_r2r(x::RArray, kinds, region = 1:ndims(x); kw...) = r2rplan(x, kinds, region)
 
-## The orthonormal DCT without `selectdim` (with a run-time dimension, WasmCodegen before
-## gbaraldi/WasmCodegen.jl#80 makes an invalid module): the same scaling, by index
+## The orthonormal DCT of N-D arrays without `selectdim`. FFTL scales the first element of each transformed
+## dimension with `selectdim(y, d, 1)`; with a run-time `d` that is a `SubArray` of unknown dimensionality on an N-D
+## array, a dynamic call WasmCodegen does not compile. Here the same scaling is done by index. Vectors keep FFTL's own
+## methods (they compile since gbaraldi/WasmCodegen.jl#80).
+const NDArray{T} = Union{AbstractArray{T,2},AbstractArray{T,3},AbstractArray{T,4},AbstractArray{T,5},AbstractArray{T,6}}
 function scale_first!(y::AbstractArray, d::Int, s)
   S, outer = FFTL.dim_extent(size(y), d)
   n = size(y, d)
@@ -166,9 +174,9 @@ dct3(x::AbstractArray, region) =
 ortho_mul(q::FFTL.OrthoDCTPlan{T}, x::AbstractArray) where {T} =
   q.inverse ? q.p * ortho_dct3_scale!(copyto!(similar(x, T), x), q.region) : ortho_dct2!(q.p * x, q.region)
 
-@overlay MT FFTL.dct(x::RArray, region = 1:ndims(x)) = dct2(x, region)
-@overlay MT FFTL.idct(x::RArray, region = 1:ndims(x)) = dct3(x, region)
-@overlay MT Base.:*(q::FFTL.OrthoDCTPlan{T}, x::AbstractArray) where {T<:FFTLFloat} = ortho_mul(q, x)
+@overlay MT FFTL.dct(x::NDArray{<:FFTLFloat}, region = 1:ndims(x)) = dct2(x, region)
+@overlay MT FFTL.idct(x::NDArray{<:FFTLFloat}, region = 1:ndims(x)) = dct3(x, region)
+@overlay MT Base.:*(q::FFTL.OrthoDCTPlan{T}, x::NDArray) where {T<:FFTLFloat} = ortho_mul(q, x)
 
 ## Build hosts with target intrinsics: FFTL's generic complex arithmetic (complexvec.jl)
 @overlay MT @inline FFTL.fcadd90(a::Vec{N,T}, b::Vec{N,T}) where {N,T} =
